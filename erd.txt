@@ -1,0 +1,554 @@
+# ERD V1 Final — Gia phả dòng họ Hoàng Đình
+
+**Status:** Source of truth cho implementation (PostgreSQL + migration + domain layer).  
+**Phase 1:** Một Family; Person chỉ có một family membership trong V1.
+
+---
+
+## Quyết định đã chốt
+
+- Một Person chỉ thuộc một Family trong V1.
+- Person **không** chứa `generation`, `branch_id`, `father_id`, `mother_id`, `spouse_id`, `family_id`.
+- `family_person` quản lý membership của Person trong dòng họ.
+- Chỉ **LINEAGE** mới có `generation`; **NON_LINEAGE** có `generation = NULL`.
+- Con gái sinh từ người thuộc dòng họ: **LINEAGE**, không tạo branch.
+- Con của con gái: **NON_LINEAGE**, vẫn tồn tại trong full family tree (relationship graph).
+- Branch chỉ bắt đầu từ generation 2; root phải **nam + LINEAGE + generation = 2**.
+- **PRIMARY / SECONDARY** tách khỏi mã **CHI_1 / CHI_2** (`branch_code`).
+- Không có `parent_branch_id` trong V1.
+- Một người có thể có nhiều spouse; tối đa 1 biological father + 1 biological mother (backend validate).
+- Spouse: canonical pair (`source_person_id < target_person_id`).
+- Media generic (`owner_type` + `owner_id`).
+- Person soft delete: `deleted_at`.
+- **Chưa có V1:** Source/Evidence, Audit, Revision, Closure Table, Elasticsearch, Redis, PostGIS, `branch_person`, `person_closure`, `ltree`.
+
+---
+
+## 1. ERD tổng thể
+
+```text
+┌──────────────────────────────┐
+│            FAMILY            │
+├──────────────────────────────┤
+│ PK id                        │
+│ name                         │
+│ description                  │
+│ founder_person_id FK         │
+│ created_at                   │
+│ updated_at                   │
+└──────────────┬───────────────┘
+               │
+               │ 1:N
+               │
+     ┌─────────┴───────────┐
+     │                     │
+     ▼                     ▼
+┌───────────────┐   ┌────────────────────┐
+│ FAMILY_PERSON │   │      BRANCH        │
+├───────────────┤   ├────────────────────┤
+│ PK family_id  │   │ PK id              │
+│ PK person_id  │   │ FK family_id       │
+│ membership    │   │ FK root_person_id  │
+│ generation    │   │ branch_type        │
+│ created_at    │   │ branch_code        │
+│ updated_at    │   │ branch_name        │
+└───────┬───────┘   │ generation         │
+        │           │ status             │
+        │           │ description        │
+        │           │ created_at         │
+        │           │ updated_at         │
+        │           └─────────┬──────────┘
+        │                     │
+        │                     │ root
+        ▼                     ▼
+┌──────────────────────────────────────────┐
+│                  PERSON                  │
+├──────────────────────────────────────────┤
+│ PK id                                    │
+│ full_name, gender, birth/death, places   │
+│ occupation, biography, note              │
+│ deleted_at                               │
+│ created_at, updated_at                   │
+└──────┬─────────────┬──────────────┬──────┘
+       │             │              │
+       ▼             ▼              ▼
+┌─────────────┐ ┌──────────────┐ ┌──────────────────┐
+│RELATIONSHIP │ │    MEDIA     │ │   PERSON_GRAVE   │
+└─────────────┘ └──────────────┘ └────────┬─────────┘
+                                            ▼
+                                      ┌───────────────┐
+                                      │     GRAVE     │
+                                      └───────────────┘
+
+┌──────────────────────┐       ┌──────────────────────┐
+│    FAMILY_EVENT      │ 1:N  │  EVENT_PARTICIPANT   │
+└──────────────────────┘──────►└──────────────────────┘
+```
+
+---
+
+## 2. Quan hệ cốt lõi
+
+```text
+                         FAMILY
+                           │
+                    FAMILY_PERSON
+                           │
+                         PERSON
+                           │
+                    ┌──────┴──────┐
+                    │             │
+             RELATIONSHIP      BRANCH
+                    │
+         PARENT_CHILD    SPOUSE
+```
+
+**Relationship** là source of truth huyết thống. **Branch** không thay thế Relationship.
+
+---
+
+## 3. Bảng V1 (10 bảng)
+
+| # | Bảng |
+|---|------|
+| 01 | family |
+| 02 | person |
+| 03 | family_person |
+| 04 | relationship |
+| 05 | branch |
+| 06 | media |
+| 07 | grave |
+| 08 | person_grave |
+| 09 | family_event |
+| 10 | event_participant |
+
+---
+
+## 4. person
+
+| Cột | Ghi chú |
+|-----|---------|
+| id | UUID PK |
+| full_name | NOT NULL |
+| gender | ENUM |
+| birth_date, death_date | |
+| birth_place, hometown, occupation | |
+| biography, note | |
+| deleted_at | Soft delete |
+| created_at, updated_at | |
+
+**Không có:** father_id, mother_id, spouse_id, branch_id, family_id, generation.
+
+Person là entity độc lập (mọi người trong family history).
+
+---
+
+## 5. family
+
+| Cột | Ghi chú |
+|-----|---------|
+| id | UUID PK |
+| name, description | |
+| founder_person_id | FK → person; **Thủy tổ**, không phải branch root |
+
+---
+
+## 6. family_person
+
+Bảng quan trọng sau `relationship`.
+
+| Cột | Ghi chú |
+|-----|---------|
+| family_id | PK/FK |
+| person_id | PK/FK |
+| membership_type | LINEAGE \| NON_LINEAGE |
+| generation | INTEGER NULL |
+| created_at, updated_at | |
+
+**LINEAGE:** có generation (1 = thủy tổ context trong family).  
+**NON_LINEAGE:** generation = NULL (vợ/chồng ngoài dòng, con của con gái, v.v.).
+
+V1: một Person ↔ một row `family_person` (một family).
+
+**Full tree:** chỉ `relationship`.  
+**Lineage tree:** `relationship` + `membership_type = LINEAGE`.
+
+---
+
+## 7. Quy tắc generation
+
+- Generation chỉ với `membership_type = LINEAGE`.
+- Là **lineage generation** (path từ founder), **không** phải tree depth.
+- Đi qua NON_LINEAGE không tăng generation cho hậu duệ NON_LINEAGE.
+
+Ví dụ:
+
+```text
+Hoàng A       LINEAGE G4
+└── Nguyễn B  NON_LINEAGE NULL
+    └── C     NON_LINEAGE NULL
+```
+
+---
+
+## 8. relationship
+
+| Cột | Ghi chú |
+|-----|---------|
+| source_person_id, target_person_id | FK person |
+| relationship_type | PARENT_CHILD \| SPOUSE |
+| start_date, end_date, note | |
+| created_at, updated_at | |
+
+**PARENT_CHILD:** source = parent, target = child.
+
+**SPOUSE:** business undirected; DB lưu canonical pair `source_person_id < target_person_id`. Nhiều spouse/person được phép.
+
+**Backend (V1):** tối đa 1 biological father + 1 biological mother; không cycle PARENT_CHILD.
+
+---
+
+## 9. branch
+
+| Cột | Ghi chú |
+|-----|---------|
+| id | UUID PK |
+| family_id | FK |
+| root_person_id | FK person, UNIQUE |
+| branch_type | PRIMARY \| SECONDARY |
+| branch_code | VD CHI_1, CHI_2 |
+| branch_name | |
+| generation | INTEGER (branch anchor, thường 2) |
+| status | ACTIVE \| ARCHIVED |
+| description | |
+| created_at, updated_at | |
+
+**Không có:** `parent_branch_id`, `branch_person`, `person.branch_id`.
+
+**Rule tạo branch:** generation = 2; root = MALE + LINEAGE + generation 2.
+
+**branch_code vs branch_type:** không hard-code CHI_1 = PRIMARY trong logic DB; dùng `branch_type` + `branch_code`.
+
+UNIQUE `(family_id, branch_code)`.
+
+---
+
+## 10. media (generic)
+
+| Cột | Ghi chú |
+|-----|---------|
+| owner_type | PERSON \| GRAVE \| EVENT |
+| owner_id | UUID |
+| media_type | PROFILE_PHOTO, GALLERY, DOCUMENT, OTHER |
+| file_name, file_url, thumbnail_url, mime_type, file_size | |
+| sort_order | |
+| created_at | |
+
+FK polymorphic — validate ở application layer.
+
+---
+
+## 11. grave / person_grave / family_event / event_participant
+
+**grave:** name, cemetery, location_description, lat/long, description, timestamps.
+
+**person_grave:** PK (person_id, grave_id), role ENUM (OWNER, SPOUSE, FAMILY_MEMBER, OTHER).
+
+**family_event:** family_id, name, event_type, event_date, location, description.
+
+**event_participant:** PK (event_id, person_id), role, note.
+
+---
+
+## 12. Index đề xuất
+
+- person: `idx_person_full_name`, `idx_person_full_name_trgm`
+- relationship: `idx_relationship_source_type`, `idx_relationship_target_type`
+- family_person: family, person, generation, membership
+- branch: family, root_person, generation, status
+- grave: cemetery
+- family_event: family, event_date
+
+---
+
+## 13. Unique constraints
+
+- `family_person`: UNIQUE (family_id, person_id)
+- `relationship`: UNIQUE (source_person_id, target_person_id, relationship_type)
+- spouse: enforce `source_person_id < target_person_id` (+ unique trên cặp)
+- `branch`: UNIQUE (root_person_id), UNIQUE (family_id, branch_code)
+
+---
+
+## 14. DB vs backend validation
+
+**PostgreSQL:** PK, FK, NOT NULL, UNIQUE, CHECK dates, no self-relationship, spouse ordering.
+
+**Backend:** 1 bio father/mother, no PARENT_CHILD cycle, branch root rules, LINEAGE ↔ generation consistency, founder ∈ family, không xóa cứng person đang referenced.
+
+---
+
+## 15. Delete strategy
+
+Soft delete Person: set `deleted_at`. Không hard delete genealogy.
+
+---
+
+## 16. Domain model (ba khái niệm tách biệt)
+
+```text
+Person ≠ Lineage Member (family_person.membership_type)
+Lineage Member ≠ Branch Member (branch root / navigation)
+```
+
+```text
+                    FAMILY
+                      │
+               FAMILY_PERSON
+          ┌───────────┴───────────┐
+      LINEAGE              NON_LINEAGE
+     generation                  NULL
+          │
+       BRANCH (gen 2, male LINEAGE root)
+          │
+       PERSON ← RELATIONSHIP → PERSON
+```
+
+---
+
+## 17. Ví dụ lineage vs full tree
+
+```text
+A → LINEAGE G2
+├── B → LINEAGE G3
+│   ├── C → LINEAGE G4
+│   └── D → LINEAGE G4
+│       └── E → NON_LINEAGE
+│           └── F → NON_LINEAGE
+└── G → LINEAGE G3
+    └── H → NON_LINEAGE
+```
+
+**Lineage tree:** A → B → C, D; A → G (ẩn E, F, H nếu filter lineage).  
+**Full tree:** toàn bộ qua relationship.
+
+---
+
+## 18. Migration order
+
+```text
+001_extensions.sql
+002_enums.sql
+003_person.sql
+004_family.sql
+005_family_person.sql
+006_relationship.sql
+007_branch.sql
+008_media.sql
+009_grave.sql
+010_person_grave.sql
+011_family_event.sql
+012_event_participant.sql
+013_indexes.sql
+014_constraints.sql
+015_triggers.sql
+```
+
+---
+
+## 19. PostgreSQL Schema V1 Final
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- Optional: CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TYPE gender_type AS ENUM ('MALE', 'FEMALE', 'UNKNOWN');
+
+CREATE TYPE membership_type AS ENUM ('LINEAGE', 'NON_LINEAGE');
+
+CREATE TYPE relationship_type AS ENUM ('PARENT_CHILD', 'SPOUSE');
+
+CREATE TYPE branch_type AS ENUM ('PRIMARY', 'SECONDARY');
+
+CREATE TYPE branch_status AS ENUM ('ACTIVE', 'ARCHIVED');
+
+CREATE TYPE media_owner_type AS ENUM ('PERSON', 'GRAVE', 'EVENT');
+
+CREATE TYPE media_type AS ENUM (
+    'PROFILE_PHOTO', 'GALLERY', 'DOCUMENT', 'OTHER'
+);
+
+CREATE TYPE grave_person_role AS ENUM (
+    'OWNER', 'SPOUSE', 'FAMILY_MEMBER', 'OTHER'
+);
+
+CREATE TYPE event_type AS ENUM (
+    'FAMILY_MEETING', 'MEMORIAL', 'GRAVE_VISIT', 'CEREMONY', 'OTHER'
+);
+
+CREATE TABLE person (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    full_name VARCHAR(255) NOT NULL,
+    gender gender_type NOT NULL DEFAULT 'UNKNOWN',
+    birth_date DATE,
+    death_date DATE,
+    birth_place VARCHAR(500),
+    hometown VARCHAR(500),
+    occupation VARCHAR(500),
+    biography TEXT,
+    note TEXT,
+    deleted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_person_dates CHECK (
+        death_date IS NULL OR birth_date IS NULL OR death_date >= birth_date
+    )
+);
+
+CREATE TABLE family (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    founder_person_id UUID REFERENCES person(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE family_person (
+    family_id UUID NOT NULL REFERENCES family(id) ON DELETE CASCADE,
+    person_id UUID NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    membership_type membership_type NOT NULL,
+    generation INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (family_id, person_id),
+    CONSTRAINT uq_family_person_person UNIQUE (person_id),
+    CONSTRAINT chk_family_person_generation CHECK (
+        (membership_type = 'LINEAGE' AND generation IS NOT NULL AND generation >= 1)
+        OR (membership_type = 'NON_LINEAGE' AND generation IS NULL)
+    )
+);
+
+CREATE TABLE relationship (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_person_id UUID NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    target_person_id UUID NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    relationship_type relationship_type NOT NULL,
+    start_date DATE,
+    end_date DATE,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_relationship_not_self CHECK (source_person_id <> target_person_id),
+    CONSTRAINT chk_relationship_dates CHECK (
+        end_date IS NULL OR start_date IS NULL OR end_date >= start_date
+    ),
+    CONSTRAINT chk_spouse_canonical CHECK (
+        relationship_type <> 'SPOUSE' OR source_person_id < target_person_id
+    ),
+    CONSTRAINT uq_relationship_pair UNIQUE (
+        source_person_id, target_person_id, relationship_type
+    )
+);
+
+CREATE TABLE branch (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    family_id UUID NOT NULL REFERENCES family(id) ON DELETE CASCADE,
+    root_person_id UUID NOT NULL REFERENCES person(id),
+    branch_type branch_type NOT NULL,
+    branch_code VARCHAR(50) NOT NULL,
+    branch_name VARCHAR(255) NOT NULL,
+    generation INTEGER NOT NULL,
+    status branch_status NOT NULL DEFAULT 'ACTIVE',
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_branch_generation CHECK (generation >= 2),
+    CONSTRAINT uq_branch_root_person UNIQUE (root_person_id),
+    CONSTRAINT uq_branch_family_code UNIQUE (family_id, branch_code)
+);
+
+CREATE TABLE media (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_type media_owner_type NOT NULL,
+    owner_id UUID NOT NULL,
+    media_type media_type NOT NULL,
+    file_name VARCHAR(500),
+    file_url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    mime_type VARCHAR(100),
+    file_size BIGINT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE grave (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255),
+    cemetery VARCHAR(500),
+    location_description TEXT,
+    latitude NUMERIC(10, 7),
+    longitude NUMERIC(10, 7),
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE person_grave (
+    person_id UUID NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    grave_id UUID NOT NULL REFERENCES grave(id) ON DELETE CASCADE,
+    role grave_person_role NOT NULL DEFAULT 'OWNER',
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (person_id, grave_id)
+);
+
+CREATE TABLE family_event (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    family_id UUID NOT NULL REFERENCES family(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    event_type event_type NOT NULL,
+    event_date DATE,
+    location VARCHAR(500),
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE event_participant (
+    event_id UUID NOT NULL REFERENCES family_event(id) ON DELETE CASCADE,
+    person_id UUID NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    role VARCHAR(255),
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (event_id, person_id)
+);
+
+-- Indexes (013_indexes.sql — tách file khi migrate)
+CREATE INDEX idx_person_full_name ON person (full_name);
+CREATE INDEX idx_relationship_source_type ON relationship (source_person_id, relationship_type);
+CREATE INDEX idx_relationship_target_type ON relationship (target_person_id, relationship_type);
+CREATE INDEX idx_family_person_family ON family_person (family_id);
+CREATE INDEX idx_family_person_person ON family_person (person_id);
+CREATE INDEX idx_family_person_generation ON family_person (generation);
+CREATE INDEX idx_family_person_membership ON family_person (membership_type);
+CREATE INDEX idx_branch_family ON branch (family_id);
+CREATE INDEX idx_branch_root_person ON branch (root_person_id);
+CREATE INDEX idx_branch_generation ON branch (generation);
+CREATE INDEX idx_branch_status ON branch (status);
+CREATE INDEX idx_grave_cemetery ON grave (cemetery);
+CREATE INDEX idx_family_event_family ON family_event (family_id);
+CREATE INDEX idx_family_event_date ON family_event (event_date);
+```
+
+---
+
+## 20. Cố ý không có trong V1
+
+father_id, mother_id, spouse_id, person.generation, person.branch_id, branch_person, parent_branch_id, person_closure, ltree, Elasticsearch, Redis, PostGIS, audit_log, source, evidence, person_revision, change_request.
+
+---
+
+## 21. Kết luận
+
+Database lưu **full biological family graph**; `family_person.membership_type` quyết định phần nào thuộc lineage Hoàng Đình. UI có thể toggle “chỉ dòng họ” / “toàn bộ gia đình” mà không redesign schema.

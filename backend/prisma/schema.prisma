@@ -1,0 +1,248 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum GenderType {
+  MALE
+  FEMALE
+  UNKNOWN
+}
+
+enum RelationshipType {
+  PARENT_CHILD
+  SPOUSE
+}
+
+enum BranchType {
+  PRIMARY
+  SECONDARY
+}
+
+enum BranchStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum FamilyPersonMembershipType {
+  LINEAGE
+  NON_LINEAGE
+}
+
+enum MediaOwnerType {
+  PERSON
+  GRAVE
+  EVENT
+}
+
+enum MediaType {
+  PROFILE_PHOTO
+  GALLERY
+  DOCUMENT
+  OTHER
+}
+
+enum GravePersonRole {
+  OWNER
+  SPOUSE
+  FAMILY_MEMBER
+  OTHER
+}
+
+enum EventType {
+  FAMILY_MEETING
+  MEMORIAL
+  GRAVE_VISIT
+  CEREMONY
+  OTHER
+}
+
+model Person {
+  id          String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fullName    String     @map("full_name") @db.VarChar(255)
+  gender      GenderType @default(UNKNOWN)
+  birthDate   DateTime?  @map("birth_date") @db.Date
+  deathDate   DateTime?  @map("death_date") @db.Date
+  birthPlace  String?    @map("birth_place") @db.VarChar(500)
+  hometown    String?    @db.VarChar(500)
+  occupation  String?    @db.VarChar(500)
+  biography   String?    @db.Text
+  note        String?    @db.Text
+  deletedAt   DateTime?  @map("deleted_at") @db.Timestamptz(6)
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  familyPerson         FamilyPerson?
+  foundedFamily        Family?              @relation("FamilyFounder")
+  branchRoots          Branch[]             @relation("BranchRoot")
+  relationshipsAsSource Relationship[]      @relation("RelSource")
+  relationshipsAsTarget Relationship[]      @relation("RelTarget")
+  personGraves         PersonGrave[]
+  eventParticipants    EventParticipant[]
+
+  @@index([fullName], map: "idx_person_full_name")
+  @@map("person")
+}
+
+model Family {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name            String   @db.VarChar(255)
+  description     String?  @db.Text
+  founderPersonId String?  @unique @map("founder_person_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  founder       Person?        @relation("FamilyFounder", fields: [founderPersonId], references: [id], onDelete: SetNull)
+  familyPersons FamilyPerson[]
+  branches      Branch[]
+  events        FamilyEvent[]
+
+  @@map("family")
+}
+
+model FamilyPerson {
+  familyId       String                     @map("family_id") @db.Uuid
+  personId       String                     @unique @map("person_id") @db.Uuid
+  membershipType FamilyPersonMembershipType @map("membership_type")
+  generation     Int?
+  createdAt      DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime                   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  person Person @relation(fields: [personId], references: [id], onDelete: Restrict)
+
+  @@id([familyId, personId])
+  @@index([familyId], map: "idx_family_person_family")
+  @@index([personId], map: "idx_family_person_person")
+  @@index([familyId, generation], map: "idx_family_person_generation")
+  @@index([familyId, membershipType], map: "idx_family_person_membership")
+  @@map("family_person")
+}
+
+model Relationship {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourcePersonId   String           @map("source_person_id") @db.Uuid
+  targetPersonId   String           @map("target_person_id") @db.Uuid
+  relationshipType RelationshipType @map("relationship_type")
+  startDate        DateTime?        @map("start_date") @db.Date
+  endDate          DateTime?        @map("end_date") @db.Date
+  note             String?          @db.Text
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  sourcePerson Person @relation("RelSource", fields: [sourcePersonId], references: [id], onDelete: Restrict)
+  targetPerson Person @relation("RelTarget", fields: [targetPersonId], references: [id], onDelete: Restrict)
+
+  @@unique([sourcePersonId, targetPersonId, relationshipType], map: "uq_relationship_pair")
+  @@index([sourcePersonId, relationshipType], map: "idx_relationship_source_type")
+  @@index([targetPersonId, relationshipType], map: "idx_relationship_target_type")
+  @@map("relationship")
+}
+
+model Branch {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  familyId     String       @map("family_id") @db.Uuid
+  rootPersonId String       @unique @map("root_person_id") @db.Uuid
+  branchType   BranchType   @map("branch_type")
+  branchCode   String       @map("branch_code") @db.VarChar(50)
+  branchName   String       @map("branch_name") @db.VarChar(255)
+  generation   Int
+  status       BranchStatus @default(ACTIVE)
+  description  String?      @db.Text
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  family     Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  rootPerson Person @relation("BranchRoot", fields: [rootPersonId], references: [id], onDelete: Restrict)
+
+  @@unique([familyId, branchCode], map: "uq_branch_family_code")
+  @@index([familyId], map: "idx_branch_family")
+  @@index([rootPersonId], map: "idx_branch_root_person")
+  @@index([generation], map: "idx_branch_generation")
+  @@index([status], map: "idx_branch_status")
+  @@map("branch")
+}
+
+model Media {
+  id           String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ownerType    MediaOwnerType @map("owner_type")
+  ownerId      String         @map("owner_id") @db.Uuid
+  mediaType    MediaType      @map("media_type")
+  fileName     String?        @map("file_name") @db.VarChar(500)
+  fileUrl      String         @map("file_url") @db.Text
+  thumbnailUrl String?        @map("thumbnail_url") @db.Text
+  mimeType     String?        @map("mime_type") @db.VarChar(100)
+  fileSize     BigInt?        @map("file_size")
+  sortOrder    Int            @default(0) @map("sort_order")
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("media")
+}
+
+model Grave {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                String?  @db.VarChar(255)
+  cemetery            String?  @db.VarChar(500)
+  locationDescription String?  @map("location_description") @db.Text
+  latitude            Decimal? @db.Decimal(10, 7)
+  longitude           Decimal? @db.Decimal(10, 7)
+  description         String?  @db.Text
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  personGraves PersonGrave[]
+
+  @@index([cemetery], map: "idx_grave_cemetery")
+  @@map("grave")
+}
+
+model PersonGrave {
+  personId  String          @map("person_id") @db.Uuid
+  graveId   String          @map("grave_id") @db.Uuid
+  role      GravePersonRole @default(OWNER)
+  note      String?         @db.Text
+  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+  grave  Grave  @relation(fields: [graveId], references: [id], onDelete: Cascade)
+
+  @@id([personId, graveId])
+  @@map("person_grave")
+}
+
+model FamilyEvent {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  familyId    String    @map("family_id") @db.Uuid
+  name        String    @db.VarChar(255)
+  eventType   EventType @map("event_type")
+  eventDate   DateTime? @map("event_date") @db.Date
+  location    String?   @db.VarChar(500)
+  description String?   @db.Text
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  family       Family             @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  participants EventParticipant[]
+
+  @@index([familyId], map: "idx_family_event_family")
+  @@index([eventDate], map: "idx_family_event_date")
+  @@map("family_event")
+}
+
+model EventParticipant {
+  eventId   String   @map("event_id") @db.Uuid
+  personId  String   @map("person_id") @db.Uuid
+  role      String?  @db.VarChar(255)
+  note      String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  event  FamilyEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  person Person      @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@id([eventId, personId])
+  @@index([personId], map: "idx_event_participant_person")
+  @@map("event_participant")
+}

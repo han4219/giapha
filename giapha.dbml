@@ -1,0 +1,252 @@
+// GIA PHẢ HOÀNG ĐÌNH — ERD V1 Final (source of truth)
+// Paste: https://dbdiagram.io
+
+Project giapha {
+  database_type: 'PostgreSQL'
+  Note: '''
+    V1 Final — 10 bảng
+    Person ≠ family_person (LINEAGE / NON_LINEAGE)
+    Relationship = source of truth; Branch = navigation (gen 2, male LINEAGE root)
+    Full tree = relationship only; Lineage tree = + membership LINEAGE
+  '''
+}
+
+Enum gender_type {
+  MALE
+  FEMALE
+  UNKNOWN
+}
+
+Enum membership_type {
+  LINEAGE [note: 'generation NOT NULL']
+  NON_LINEAGE [note: 'generation NULL']
+}
+
+Enum relationship_type {
+  PARENT_CHILD [note: 'source=parent, target=child']
+  SPOUSE [note: 'source_person_id < target_person_id']
+}
+
+Enum branch_type {
+  PRIMARY
+  SECONDARY
+}
+
+Enum branch_status {
+  ACTIVE
+  ARCHIVED
+}
+
+Enum media_owner_type {
+  PERSON
+  GRAVE
+  EVENT
+}
+
+Enum media_type {
+  PROFILE_PHOTO
+  GALLERY
+  DOCUMENT
+  OTHER
+}
+
+Enum grave_person_role {
+  OWNER
+  SPOUSE
+  FAMILY_MEMBER
+  OTHER
+}
+
+Enum event_type {
+  FAMILY_MEETING
+  MEMORIAL
+  GRAVE_VISIT
+  CEREMONY
+  OTHER
+}
+
+TableGroup core {
+  person
+  family
+  family_person
+  relationship
+  branch
+}
+
+TableGroup supporting {
+  media
+  grave
+  person_grave
+  family_event
+  event_participant
+}
+
+Table person {
+  id uuid [pk, default: `gen_random_uuid()`]
+  full_name varchar(255) [not null]
+  gender gender_type [not null, default: 'UNKNOWN']
+  birth_date date
+  death_date date
+  birth_place varchar(500)
+  hometown varchar(500)
+  occupation varchar(500)
+  biography text
+  note text
+  deleted_at timestamptz [note: 'Soft delete']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: 'Không có family_id, generation, branch_id, father/mother/spouse'
+}
+
+Table family {
+  id uuid [pk, default: `gen_random_uuid()`]
+  name varchar(255) [not null]
+  description text
+  founder_person_id uuid [note: 'Thủy tổ — không phải branch root']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+}
+
+Table family_person {
+  family_id uuid [not null]
+  person_id uuid [not null]
+  membership_type membership_type [not null]
+  generation integer [note: 'NULL iff NON_LINEAGE']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: 'V1: UNIQUE(person_id) — một person một family'
+
+  indexes {
+    (family_id, person_id) [pk]
+    (person_id) [unique, name: 'uq_family_person_person']
+    (family_id) [name: 'idx_family_person_family']
+    (generation) [name: 'idx_family_person_generation']
+    (membership_type) [name: 'idx_family_person_membership']
+  }
+}
+
+Table relationship {
+  id uuid [pk, default: `gen_random_uuid()`]
+  source_person_id uuid [not null]
+  target_person_id uuid [not null]
+  relationship_type relationship_type [not null]
+  start_date date
+  end_date date
+  note text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (source_person_id, target_person_id, relationship_type) [unique, name: 'uq_relationship_pair']
+    (source_person_id, relationship_type) [name: 'idx_relationship_source_type']
+    (target_person_id, relationship_type) [name: 'idx_relationship_target_type']
+  }
+}
+
+Table branch {
+  id uuid [pk, default: `gen_random_uuid()`]
+  family_id uuid [not null]
+  root_person_id uuid [not null, unique]
+  branch_type branch_type [not null]
+  branch_code varchar(50) [not null, note: 'CHI_1, CHI_2, ...']
+  branch_name varchar(255) [not null]
+  generation integer [not null, note: '>= 2']
+  status branch_status [not null, default: 'ACTIVE']
+  description text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: 'Không parent_branch_id. Root: MALE + LINEAGE + gen 2'
+
+  indexes {
+    (family_id, branch_code) [unique, name: 'uq_branch_family_code']
+    (root_person_id) [unique, name: 'uq_branch_root_person']
+    (family_id) [name: 'idx_branch_family']
+    (generation) [name: 'idx_branch_generation']
+    (status) [name: 'idx_branch_status']
+  }
+}
+
+Table media {
+  id uuid [pk, default: `gen_random_uuid()`]
+  owner_type media_owner_type [not null]
+  owner_id uuid [not null]
+  media_type media_type [not null]
+  file_name varchar(500)
+  file_url text [not null]
+  thumbnail_url text
+  mime_type varchar(100)
+  file_size bigint
+  sort_order integer [not null, default: 0]
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: 'Polymorphic owner — FK validate ở app'
+}
+
+Table grave {
+  id uuid [pk, default: `gen_random_uuid()`]
+  name varchar(255)
+  cemetery varchar(500)
+  location_description text
+  latitude decimal(10, 7)
+  longitude decimal(10, 7)
+  description text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+}
+
+Table person_grave {
+  person_id uuid [not null]
+  grave_id uuid [not null]
+  role grave_person_role [not null, default: 'OWNER']
+  note text
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (person_id, grave_id) [pk]
+  }
+}
+
+Table family_event {
+  id uuid [pk, default: `gen_random_uuid()`]
+  family_id uuid [not null]
+  name varchar(255) [not null]
+  event_type event_type [not null]
+  event_date date
+  location varchar(500)
+  description text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+}
+
+Table event_participant {
+  event_id uuid [not null]
+  person_id uuid [not null]
+  role varchar(255)
+  note text
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (event_id, person_id) [pk]
+  }
+}
+
+Ref: family.founder_person_id > person.id
+
+Ref: family_person.family_id > family.id [delete: cascade]
+Ref: family_person.person_id > person.id [delete: cascade]
+
+Ref: relationship.source_person_id > person.id [delete: cascade]
+Ref: relationship.target_person_id > person.id [delete: cascade]
+
+Ref: branch.family_id > family.id [delete: cascade]
+Ref: branch.root_person_id > person.id
+
+Ref: person_grave.person_id > person.id [delete: cascade]
+Ref: person_grave.grave_id > grave.id [delete: cascade]
+
+Ref: family_event.family_id > family.id [delete: cascade]
+Ref: event_participant.event_id > family_event.id [delete: cascade]
+Ref: event_participant.person_id > person.id [delete: cascade]

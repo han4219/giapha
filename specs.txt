@@ -1,0 +1,2319 @@
+# GIA PHẢ DÒNG HỌ HOÀNG ĐÌNH
+
+## Business Requirement & System Architecture — V1
+
+**Version:** 1.1 (khớp ERD V1 Final)
+**Phase:** Phase 1 — Chi thứ nhất
+**Scope:** Web Public Family Tree
+**Target:** Hệ thống có khả năng mở rộng qua nhiều thế hệ
+
+**Database / schema:** xem [`erd.txt`](erd.txt) — source of truth (10 bảng PostgreSQL).
+
+---
+
+# 1. Product Vision
+
+Xây dựng website số hóa gia phả dòng họ Hoàng Đình, phục vụ việc lưu trữ lịch sử dòng họ, tra cứu thành viên và khám phá quan hệ gia đình qua nhiều thế hệ.
+
+Hệ thống ban đầu triển khai cho **một chi**, nhưng architecture phải được thiết kế để sau này mở rộng thành toàn bộ 4 chi của dòng họ.
+
+Mục tiêu dài hạn:
+
+> Biến website thành một "digital family archive" của dòng họ Hoàng Đình, có khả năng lưu trữ và tiếp tục phát triển qua nhiều thế hệ.
+
+---
+
+# 2. Scope của hệ thống
+
+## 2.1. Cấu trúc dòng họ
+
+Dòng họ có một Thủy tổ.
+
+```text
+Đời 1
+Thủy tổ
+│
+├── Con 1 → Chi 1
+├── Con 2 → Chi 2
+├── Con 3 → Chi 3
+└── Con 4 → Chi 4
+```
+
+Từ đời 2, dòng họ được chia thành 4 chi lớn.
+
+Mỗi chi tiếp tục phát triển thành các nhánh nhỏ.
+
+Phase 1 chỉ triển khai:
+
+```text
+Hoàng Đình
+└── Chi 1
+```
+
+Nhưng hệ thống phải sẵn sàng cho:
+
+```text
+Hoàng Đình
+├── Chi 1
+├── Chi 2
+├── Chi 3
+└── Chi 4
+```
+
+---
+
+# 3. Generation Model
+
+Quy ước:
+
+```text
+Đời 1 = Thủy tổ
+
+Đời 2 = Con của Thủy tổ
+
+Đời 3 = Con của người đời 2
+
+...
+
+Đời 20 = hậu duệ đời thứ 20
+```
+
+Generation được xác định dựa trên quan hệ huyết thống.
+
+Ví dụ:
+
+```text
+A — Đời 1
+│
+├── B — Đời 2
+│   │
+│   ├── D — Đời 3
+│   │
+│   └── E — Đời 3
+│
+└── C — Đời 2
+```
+
+Relationship là nguồn dữ liệu gốc cho **full family tree**.
+
+**Generation (đời dòng họ)** không nằm trên `Person`. Chỉ lưu trên `family_person` khi `membership_type = LINEAGE`. `NON_LINEAGE` có `generation = NULL`.
+
+Generation là **lineage generation** (path từ founder), không phải độ sâu cây UI. Đi qua nhánh NON_LINEAGE không gán generation cho hậu duệ NON_LINEAGE.
+
+Ví dụ:
+
+```text
+Hoàng A       LINEAGE     generation 4
+└── Nguyễn B  NON_LINEAGE generation NULL
+    └── C     NON_LINEAGE generation NULL
+```
+
+Backend có thể derive/recalc generation từ relationship + founder, nhưng `family_person.generation` là giá trị denormalized phục vụ filter/search/navigation.
+
+---
+
+# 4. Business Rule về giới tính
+
+Tất cả thành viên đều được lưu như `Person`.
+
+```text
+Male
+Female
+Unknown
+```
+
+Không có rule:
+
+```text
+Female → không lưu
+```
+
+Người nữ vẫn có:
+
+* thông tin cá nhân
+* cha mẹ
+* anh chị em
+* vợ/chồng
+* con
+* ảnh
+* tiểu sử
+* quê quán
+* sự nghiệp
+
+Tuy nhiên, theo quy ước dòng họ:
+
+> Chỉ hậu duệ nam thuộc dòng chính mới tiếp tục hình thành nhánh dòng họ.
+
+Ví dụ:
+
+```text
+Hoàng A
+│
+├── Hoàng B (nam)
+│    │
+│    ├── Hoàng D
+│    └── Hoàng E
+│
+└── Hoàng C (nữ)
+     │
+     └── Không tạo lineage branch
+```
+
+Điểm quan trọng:
+
+**Gender không quyết định Person có tồn tại hay không.**
+
+Gender chỉ tham gia vào **rule tạo Branch** (root branch: nam + LINEAGE + generation 2). **Không** dùng gender để quyết định `LINEAGE` vs `NON_LINEAGE` — dùng `family_person.membership_type`.
+
+Quy tắc đã chốt:
+
+* Con gái sinh từ người LINEAGE: vẫn **LINEAGE**, **không** tạo branch.
+* Con của con gái: **NON_LINEAGE**, vẫn là `Person` + `PARENT_CHILD` trong full tree.
+
+---
+
+# 5. Core Domain Model
+
+Hệ thống có 7 domain chính:
+
+```text
+Family
+FamilyPerson   (family_person — membership trong dòng họ)
+Branch
+Person
+Relationship
+Grave
+Family Event
+```
+
+Ngoài ra có các supporting domain:
+
+```text
+Media
+Search
+Authentication / Authorization
+```
+
+Phase 1 schema **chưa** có Audit / Revision / Source / Evidence (xem `erd.txt`).
+
+---
+
+# 6. Family
+
+`Family` đại diện cho toàn bộ dòng họ.
+
+Ví dụ:
+
+```text
+Family
+---------
+id
+name
+description
+founderPersonId
+createdAt
+updatedAt
+```
+
+Dữ liệu:
+
+```text
+id: family-hoang-dinh
+name: Dòng họ Hoàng Đình
+```
+
+Một Family có nhiều Branch (anchor từ đời 2). V1: một Person chỉ có **một** row `family_person` (một family).
+
+```text
+Family
+├── Branch (CHI_1 …)
+└── family_person (mọi Person thuộc family)
+```
+
+---
+
+# 7. FamilyPerson (`family_person`)
+
+Bảng biểu diễn **Person thuộc dòng họ Hoàng Đình như thế nào** — tách khỏi entity `Person`.
+
+```text
+FamilyPerson
+---------
+familyId          PK/FK
+personId          PK/FK  (UNIQUE trong V1 — một person một family)
+membershipType    LINEAGE | NON_LINEAGE
+generation        INTEGER NULL
+createdAt
+updatedAt
+```
+
+| membershipType | generation | Ý nghĩa |
+|----------------|------------|---------|
+| LINEAGE | NOT NULL (≥1) | Thuộc dòng họ (kể cả nữ trong dòng) |
+| NON_LINEAGE | NULL | Vợ/chồng ngoài dòng, con của con gái, v.v. |
+
+**Full Family Tree:** query chỉ `relationship` (không filter membership).
+
+**Lineage Tree:** `relationship` + chỉ hiển thị / traverse qua `membership_type = LINEAGE` (UI toggle).
+
+Ba khái niệm tách biệt:
+
+```text
+Person ≠ Lineage Member (family_person)
+Lineage Member ≠ Branch root (branch.rootPersonId)
+```
+
+---
+
+# 8. Branch
+
+`Branch` là **anchor navigation** cho chi/nhánh từ **đời 2**, không thay thế `relationship`.
+
+V1 **không có** `parentBranchId`, `branch_person`, `person.branchId`. Cây huyết thống nằm trong `relationship`; descendants của branch root lấy bằng graph query.
+
+Conceptual model:
+
+```text
+Branch
+---------
+id
+familyId
+rootPersonId      UNIQUE — một person chỉ là root một branch
+branchType        PRIMARY | SECONDARY
+branchCode        VD CHI_1, CHI_2 (UNIQUE per family)
+branchName
+generation        INTEGER (≥ 2, thường = 2 cho chi gốc)
+status            ACTIVE | ARCHIVED
+description
+createdAt
+updatedAt
+```
+
+**Rule tạo branch (backend):** chỉ từ generation 2; `rootPerson` phải `MALE` + `LINEAGE` + `generation = 2`.
+
+**PRIMARY / SECONDARY** tách khỏi mã chi — không hard-code `CHI_1 = PRIMARY` trong DB logic:
+
+```text
+branchCode   branchName   branchType
+CHI_1        Chi 1        PRIMARY
+CHI_2        Chi 2        SECONDARY
+CHI_3        Chi 3        SECONDARY
+CHI_4        Chi 4        SECONDARY
+```
+
+`founderPersonId` trên Family là **Thủy tổ** (đời 1), không phải branch root.
+
+Phase 1 deploy **Chi 1**; schema sẵn sàng Chi 2–4.
+
+---
+
+# 9. Person
+
+Person là entity trung tâm.
+
+Conceptual model:
+
+```text
+Person
+---------
+id
+fullName
+gender
+birthDate
+deathDate
+birthYear
+deathYear
+birthPlace
+hometown
+occupation
+biography
+note
+deletedAt           soft delete
+createdAt
+updatedAt
+```
+
+**Không có trên Person:** `familyId`, `generation`, `branchId`, `fatherId`, `motherId`, `spouseId`.
+
+Ảnh đại diện qua bảng `Media` (`ownerType = PERSON`), không cột `profilePhoto` trên Person.
+
+Phase 1 có thể nhập tối thiểu: `fullName`, `gender`, năm sinh/mất (map `birthDate`/`deathDate`), `hometown`, `biography`.
+
+---
+
+# 10. Person không nên chứa trực tiếp fatherId / motherId
+
+Không nên thiết kế core database:
+
+```text
+person
+---------
+id
+fatherId
+motherId
+motherId
+spouseId
+```
+
+Thay vào đó:
+
+```text
+Person
+   │
+   ▼
+Relationship
+   │
+   ▼
+Person
+```
+
+Ví dụ:
+
+```text
+A
+│
+└── PARENT_OF → B
+```
+
+---
+
+# 11. Relationship
+
+Relationship là một entity độc lập.
+
+Conceptual model:
+
+```text
+Relationship
+---------
+id
+sourcePersonId
+targetPersonId
+relationshipType
+startDate
+endDate
+note
+createdAt
+updatedAt
+```
+
+Các type ban đầu:
+
+```text
+PARENT_CHILD
+SPOUSE
+```
+
+Sau này có thể mở rộng:
+
+```text
+ADOPTIVE_PARENT_CHILD
+STEP_PARENT_CHILD
+```
+
+Nhưng không cần implement tất cả ở Phase 1 nếu thực tế chưa cần.
+
+---
+
+# 12. Parent / Child
+
+Ví dụ:
+
+```text
+A → PARENT_CHILD → B
+```
+
+Có thể biểu diễn:
+
+```text
+A
+│
+└── child → B
+```
+
+hoặc query ngược:
+
+```text
+B
+│
+└── parent → A
+```
+
+Không cần lưu đồng thời:
+
+```text
+fatherId
+motherId
+parentIds
+childIds
+```
+
+Relationship là source of truth.
+
+**V1 (backend validate):** mỗi Person tối đa **một biological father** và **một biological mother**; không tạo cycle `PARENT_CHILD`. DB chưa model ADOPTIVE/STEP (mở rộng sau).
+
+---
+
+# 13. Spouse
+
+Hôn nhân cũng dùng Relationship.
+
+```text
+A
+│
+└── SPOUSE → B
+```
+
+Điều này cho phép hỗ trợ sau này:
+
+```text
+A ── B
+│
+└── marriage period
+
+A ── C
+│
+└── second marriage
+```
+
+Không khóa Person vào một spouse duy nhất — nhiều bản ghi `SPOUSE` hợp lệ.
+
+**Lưu trữ V1:** canonical pair — `sourcePersonId < targetPersonId`, một record duy nhất cho mỗi cặp (không A→B và B→A).
+
+---
+
+# 14. Lineage Branch
+
+Đây là phần đặc thù của dòng họ.
+
+Không phải Person nào cũng là branch root.
+
+Ví dụ:
+
+```text
+A (male)
+│
+├── B (male) → branch
+├── C (female)
+└── D (male) → branch
+```
+
+B và D có thể tạo branch.
+
+C vẫn tồn tại trong Person tree nhưng không tạo lineage branch.
+
+Conceptually:
+
+```text
+Person
+   │
+   └── canCreateBranch
+```
+
+Không lưu `canCreateBranch` trên Person. Suy ra từ: `gender`, `family_person` (LINEAGE + generation), quan hệ con trai có hay không.
+
+Con gái LINEAGE: **không** tạo branch. Nam LINEAGE đời 2: có thể là **branch root** (4 chi).
+
+---
+
+# 15. Chi và loại branch (V1 Final)
+
+Bốn chi lớn (đời 2) dùng cùng entity `Branch`:
+
+```text
+branchType = PRIMARY   → thường Chi 1 (Phase 1)
+branchType = SECONDARY → Chi 2, 3, 4
+branchCode = CHI_1 | CHI_2 | CHI_3 | CHI_4
+```
+
+V1 **không** model cây `Sub Branch` bằng `parentBranchId`. Nhánh con trong một chi được khám phá qua **relationship graph** + filter generation/lineage; nếu sau này cần anchor nhánh sâu hơn có thể bổ sung schema mà không đụng `Person`.
+
+---
+
+# 16. Grave Domain
+
+Mộ phần là domain độc lập.
+
+```text
+Grave
+---------
+id
+name
+location
+cemetery
+latitude
+longitude
+description
+photo
+createdAt
+updatedAt
+```
+
+Quan hệ:
+
+```text
+Person
+   │
+   └── Grave
+```
+
+Nhưng không nên assume:
+
+```text
+1 Person = 1 Grave
+```
+
+Vì tương lai có thể có:
+
+* mộ chung
+* cải táng
+* nhiều vị trí
+* mộ gia đình
+
+Do đó có thể cần:
+
+```text
+Person ↔ Grave
+```
+
+thay vì foreign key cứng một chiều.
+
+---
+
+# 17. Family Event
+
+Ví dụ:
+
+```text
+FamilyEvent
+---------
+id
+name
+eventType
+date
+location
+description
+createdAt
+updatedAt
+```
+
+Event type (V1):
+
+```text
+FAMILY_MEETING
+MEMORIAL
+GRAVE_VISIT
+CEREMONY
+OTHER
+```
+
+Người tham gia:
+
+```text
+FamilyEvent
+     │
+     └── EventParticipant
+             │
+             └── Person
+```
+
+---
+
+# 18. Media
+
+Ảnh không nên lưu binary trực tiếp trong Person.
+
+Nên có:
+
+```text
+Media
+---------
+id
+ownerType         PERSON | GRAVE | EVENT
+ownerId           UUID (polymorphic — validate ở application)
+mediaType         PROFILE_PHOTO | GALLERY | DOCUMENT | OTHER
+fileUrl
+thumbnailUrl
+fileName
+mimeType
+fileSize
+sortOrder
+createdAt
+```
+
+Ví dụ:
+
+```text
+Person
+ ├── profile photo
+ ├── family photo
+ └── historical photo
+```
+
+Sau này:
+
+```text
+Grave
+ └── photos
+
+Event
+ └── photos
+
+Person
+ └── photos
+```
+
+đều dùng Media.
+
+---
+
+# 19. Domain Relationship tổng thể
+
+```text
+                         FAMILY
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+       FAMILY_PERSON                   BRANCH
+              │                           │
+              └─────────────┬─────────────┘
+                            │
+                          PERSON ◄── EVENT PARTICIPANT ◄── FAMILY_EVENT
+                            │
+              ┌─────────────┼─────────────┐
+              │             │             │
+              ▼             ▼             ▼
+       RELATIONSHIP      MEDIA      PERSON_GRAVE → GRAVE
+              │
+         PARENT_CHILD / SPOUSE
+              │
+            PERSON
+```
+
+Chi tiết schema: [`erd.txt`](erd.txt).
+
+---
+
+# 20. User Flow — Public Visitor
+
+Phase 1 chưa cần login để xem.
+
+Flow chính:
+
+```text
+Homepage
+   │
+   ├── Giới thiệu dòng họ
+   │
+   ├── Cây gia phả
+   │
+   ├── Tìm kiếm
+   │
+   ├── Mộ phần
+   │
+   └── Sự kiện
+```
+
+---
+
+# 21. Homepage
+
+Homepage nên trả lời ngay 3 câu hỏi:
+
+1. Đây là dòng họ nào?
+2. Cấu trúc dòng họ như thế nào?
+3. Tôi muốn tìm ai?
+
+Proposed layout:
+
+```text
+┌───────────────────────────────────────────────┐
+│ HOÀNG ĐÌNH                    🔍 Tìm kiếm     │
+├───────────────────────────────────────────────┤
+│                                               │
+│       GIA PHẢ DÒNG HỌ HOÀNG ĐÌNH             │
+│                                               │
+│       Lưu giữ ký ức qua nhiều thế hệ         │
+│                                               │
+│          [ Khám phá gia phả ]                │
+│                                               │
+├───────────────────────────────────────────────┤
+│                                               │
+│  🌳 Cây gia phả                               │
+│                                               │
+│  20+ đời  |  1 chi hiện tại                  │
+│                                               │
+│          Thủy tổ                              │
+│             │                                 │
+│       ┌─────┴─────┐                           │
+│       │           │                           │
+│     Chi 1       ...                          │
+│                                               │
+├───────────────────────────────────────────────┤
+│                                               │
+│   👨‍👩‍👧 Thành viên    🪦 Mộ phần    📅 Sự kiện │
+│                                               │
+└───────────────────────────────────────────────┘
+```
+
+---
+
+# 22. Family Tree UX
+
+Đây là màn hình quan trọng nhất.
+
+Không hiển thị 20 đời cùng lúc.
+
+Thay vào đó:
+
+```text
+Tree Explorer
+```
+
+Có:
+
+```text
+Search
+Generation selector (LINEAGE generation từ family_person)
+Branch selector (CHI_1 …)
+Toggle: Full family tree | Lineage only
+Zoom
+Pan
+Collapse
+Expand
+Focus
+```
+
+**Full tree:** mọi Person nối bởi relationship (kể cả NON_LINEAGE).
+
+**Lineage tree:** ẩn / không mở rộng nhánh NON_LINEAGE (con của con gái, v.v.) theo toggle.
+
+---
+
+# 23. Tree Navigation
+
+Thanh điều khiển:
+
+```text
+← Chi 1
+
+🔍 Tìm người...
+
+Đời [ 8 ▼ ]
+
+[Ancestors] [Descendants]
+
+− 100% +
+```
+
+Breadcrumb:
+
+```text
+Hoàng Đình
+>
+Chi 1
+>
+Đời 8
+>
+Nhánh Hoàng Đình X
+```
+
+---
+
+# 24. Tree Node
+
+Node không nên quá nhiều thông tin.
+
+```text
+┌─────────────────────┐
+│      [PHOTO]        │
+│                     │
+│  Hoàng Đình An      │
+│  1950 — 2020        │
+│                     │
+│  Đời 8              │
+└─────────────────────┘
+```
+
+Click node:
+
+```text
+→ mở Person Detail
+```
+
+Hover:
+
+```text
+→ quick preview
+```
+
+---
+
+# 25. Person Detail
+
+Trang/profile:
+
+```text
+┌─────────────────────────────────────────┐
+│                                         │
+│            [ PROFILE PHOTO ]            │
+│                                         │
+│          Hoàng Đình An                  │
+│          1950 — 2020                    │
+│                                         │
+│          Đời 8 · Chi 1                  │
+│                                         │
+├─────────────────────────────────────────┤
+│ THÔNG TIN                                │
+│ Quê quán: ...                           │
+│ Nghề nghiệp: ...                        │
+│                                         │
+├─────────────────────────────────────────┤
+│ TIỂU SỬ                                  │
+│ ...                                     │
+│                                         │
+├─────────────────────────────────────────┤
+│ GIA ĐÌNH                                 │
+│                                         │
+│ Cha: ...                                │
+│ Mẹ: ...                                 │
+│ Vợ/chồng: ...                           │
+│                                         │
+├─────────────────────────────────────────┤
+│ CON CÁI                                  │
+│                                         │
+│ ├── ...                                 │
+│ ├── ...                                 │
+│ └── ...                                 │
+│                                         │
+├─────────────────────────────────────────┤
+│ [ XEM TRÊN CÂY ]                        │
+│ [ XEM TỔ TIÊN ]                         │
+│ [ XEM HẬU DUỆ ]                         │
+└─────────────────────────────────────────┘
+```
+
+---
+
+# 26. Search UX
+
+Search là một trong những chức năng quan trọng nhất vì tree có thể rất lớn.
+
+Search:
+
+```text
+🔍 Tìm kiếm trong gia phả...
+```
+
+Có thể search:
+
+```text
+Tên
+Tên gần đúng
+Đời
+Chi
+Quê quán
+```
+
+Result:
+
+```text
+Hoàng Đình An
+Đời 8 · Chi 1
+1950 — 2020
+
+Hoàng Đình Anh
+Đời 12 · Chi 1
+1980 —
+```
+
+Click result:
+
+```text
+Person Detail
+```
+
+hoặc:
+
+```text
+View on Tree
+```
+
+---
+
+# 27. Focus Mode
+
+Khi chọn một người:
+
+```text
+             Ông
+              │
+             Cha
+              │
+        ┌─────┴─────┐
+        │           │
+       A            B
+        │
+    ┌───┴───┐
+    C       D
+```
+
+Tree chỉ render vùng liên quan.
+
+Default:
+
+```text
+2 generations ancestors
++
+current person
++
+2 generations descendants
+```
+
+Có thể cho user mở rộng.
+
+Đây là giải pháp chính cho bài toán 20 đời.
+
+---
+
+# 28. Ancestor Mode
+
+Ví dụ:
+
+```text
+[Xem tổ tiên]
+```
+
+Hiển thị:
+
+```text
+Thủy tổ
+   │
+   ...
+   │
+Ông cố
+   │
+Ông
+   │
+Cha
+   │
+Người đang xem
+```
+
+Không render toàn bộ hậu duệ.
+
+---
+
+# 29. Descendant Mode
+
+Ví dụ:
+
+```text
+[Xem hậu duệ]
+```
+
+Hiển thị:
+
+```text
+Người A
+│
+├── B
+│   ├── D
+│   └── E
+│
+└── C
+    ├── F
+    └── G
+```
+
+Có thể giới hạn:
+
+```text
+1 đời
+2 đời
+3 đời
+Tất cả
+```
+
+---
+
+# 30. Branch Explorer
+
+Đây là UX đặc biệt cho hệ thống này.
+
+Ví dụ:
+
+```text
+CHI 1
+
+Người sáng lập
+│
+├── Nhánh A
+│
+├── Nhánh B
+│
+├── Nhánh C
+│
+└── Nhánh D
+```
+
+Click Nhánh B:
+
+```text
+Chi 1
+└── Nhánh B
+     │
+     ├── Đời 5
+     ├── Đời 6
+     ├── Đời 7
+     └── ...
+```
+
+Như vậy người dùng có thể "đi sâu" vào dòng họ.
+
+---
+
+# 31. Synthetic Dataset
+
+Không cần raw data thật ở giai đoạn này.
+
+Ta sẽ tạo dữ liệu mô phỏng.
+
+Ví dụ:
+
+```text
+Generation 1
+1 person
+
+Generation 2
+4 persons
+
+Generation 3
+~16 persons
+
+Generation 4
+~50 persons
+
+Generation 5
+~150 persons
+
+Generation 6
+~400 persons
+
+Generation 7
+~1,000 persons
+
+Generation 8+
+tăng dần
+```
+
+Không nhất thiết phải đúng toán học tuyệt đối.
+
+Mục tiêu:
+
+```text
+UX testing
+Rendering testing
+Search testing
+Database testing
+API testing
+```
+
+---
+
+# 32. Dataset nên có cả các trường hợp đặc biệt
+
+Synthetic data không nên chỉ là:
+
+```text
+A → B → C
+```
+
+Mà phải có:
+
+```text
+Male
+Female
+
+Person without photo
+
+Person without birth year
+
+Person without death year
+
+Person with spouse
+
+Person without spouse
+
+Person with many children
+
+Person with no children
+
+Person with long biography
+
+LINEAGE female (no branch)
+
+NON_LINEAGE spouse
+
+NON_LINEAGE child of LINEAGE daughter
+
+Full tree vs lineage tree toggle cases
+```
+
+Để test UI thực tế.
+
+---
+
+# 33. Database Conceptual ERD
+
+ERD V1 Final — **10 bảng**. DDL đầy đủ và index/constraint: [`erd.txt`](erd.txt). DBML xem [`giapha.dbml`](giapha.dbml).
+
+```text
+FAMILY ──┬── FAMILY_PERSON ── PERSON ──┬── RELATIONSHIP
+         │                            ├── MEDIA (owner_type/id)
+         └── BRANCH (root_person)     └── PERSON_GRAVE ── GRAVE
+
+FAMILY ── FAMILY_EVENT ── EVENT_PARTICIPANT ── PERSON
+```
+
+Cố ý **chưa có V1:** `parent_branch_id`, `branch_person`, `person_closure`, audit/revision/source/evidence, Redis/ES/PostGIS.
+
+---
+
+# 34. API Architecture
+
+Backend nên expose resource-oriented API.
+
+Ví dụ:
+
+```text
+GET /api/families
+GET /api/families/{familyId}
+
+GET /api/families/{familyId}/branches
+GET /api/branches/{branchId}
+
+GET /api/branches/{branchId}/tree
+GET /api/branches/{branchId}/generations/{generation}
+
+GET /api/persons/{personId}
+
+GET /api/persons/{personId}/parents
+GET /api/persons/{personId}/children
+GET /api/persons/{personId}/spouses
+GET /api/persons/{personId}/ancestors
+GET /api/persons/{personId}/descendants
+
+GET /api/persons/{personId}/family-membership
+
+GET /api/persons/search?q=...
+
+GET /api/branches/{branchId}/tree?mode=lineage|full
+
+GET /api/graves
+GET /api/graves/{graveId}
+
+GET /api/events
+GET /api/events/{eventId}
+```
+
+---
+
+# 35. Không nên API trả toàn bộ tree
+
+Không nên:
+
+```text
+GET /tree
+```
+
+và trả 10,000 Person + toàn bộ relationship.
+
+Thay vào đó:
+
+```text
+GET /branches/{branchId}/tree?generation=8
+```
+
+hoặc:
+
+```text
+GET /persons/{personId}/descendants?depth=3
+```
+
+Ví dụ:
+
+```text
+GET /persons/123/descendants?depth=3
+```
+
+Backend chỉ trả dữ liệu cần thiết.
+
+---
+
+# 36. API cho Focus Mode
+
+Ví dụ:
+
+```text
+GET /persons/{id}/family-context?ancestorDepth=2&descendantDepth=3
+```
+
+Response concept:
+
+```json
+{
+  "center": {},
+  "ancestors": [],
+  "descendants": [],
+  "spouses": [],
+  "siblings": [],
+  "relationships": []
+}
+```
+
+Frontend dùng response này để render.
+
+---
+
+# 37. API cho Generation
+
+Ví dụ:
+
+```text
+GET /branches/{branchId}/generations
+```
+
+Response:
+
+```json
+[
+  {
+    "generation": 2,
+    "personCount": 4
+  },
+  {
+    "generation": 3,
+    "personCount": 16
+  },
+  {
+    "generation": 4,
+    "personCount": 48
+  }
+]
+```
+
+UI:
+
+```text
+Đời 2  (4)
+Đời 3  (16)
+Đời 4  (48)
+Đời 5  (152)
+...
+```
+
+Rất hữu ích cho navigation.
+
+---
+
+# 38. Performance Strategy
+
+Vì tree có thể rất lớn:
+
+## Không load tất cả ngay
+
+Initial page:
+
+```text
+Family metadata
++
+Branch summary
++
+Generation summary
+```
+
+Sau đó lazy load:
+
+```text
+User opens branch
+        ↓
+Load branch data
+        ↓
+User expands node
+        ↓
+Load children
+```
+
+---
+
+# 39. Frontend Rendering Strategy
+
+Tree nên hỗ trợ:
+
+```text
+Lazy rendering
+Virtualization
+Node collapsing
+Viewport-based rendering
+```
+
+Không nên tạo DOM cho hàng nghìn node nằm ngoài viewport nếu library/UI cho phép tránh điều đó.
+
+---
+
+# 40. Search Architecture
+
+Ban đầu PostgreSQL có thể xử lý search.
+
+Không cần Elasticsearch/OpenSearch ngay.
+
+Phase 1:
+
+```text
+PostgreSQL
+   │
+   └── indexed search
+```
+
+Khi dữ liệu thực tế lớn hơn đáng kể mới cân nhắc:
+
+```text
+PostgreSQL
+      │
+      ▼
+OpenSearch / Elasticsearch
+```
+
+Không nên over-engineering ngay từ đầu.
+
+---
+
+# 41. Caching
+
+Các dữ liệu như:
+
+```text
+Family metadata
+Branch metadata
+Generation summary
+Person profile
+```
+
+có thể cache.
+
+Nhưng Phase 1:
+
+> PostgreSQL + application-level caching là đủ.
+
+Không cần Redis ngay nếu traffic chưa chứng minh cần.
+
+---
+
+# 42. Security
+
+Phase 1:
+
+```text
+Public
+  ↓
+Read-only
+```
+
+Nhưng architecture phải chuẩn bị:
+
+```text
+Guest
+Member
+Editor
+Branch Admin
+Family Admin
+```
+
+Về sau:
+
+```text
+Guest
+  READ_PUBLIC
+
+Member
+  READ_FAMILY
+
+Editor
+  CREATE / UPDATE
+
+Branch Admin
+  MANAGE_BRANCH
+
+Family Admin
+  MANAGE_FAMILY
+```
+
+---
+
+# 43. Admin Architecture
+
+Website public nhưng chắc chắn sẽ cần một nơi quản trị.
+
+Tôi khuyên tách:
+
+```text
+Public Website
+```
+
+và:
+
+```text
+Admin / CMS
+```
+
+Ví dụ:
+
+```text
+gia-pha.com
+```
+
+và:
+
+```text
+admin.gia-pha.com
+```
+
+Public:
+
+```text
+READ
+```
+
+Admin:
+
+```text
+CRUD
+```
+
+---
+
+# 44. Admin — Person Management
+
+Admin có thể:
+
+```text
+Person
+├── Create
+├── Edit
+├── Delete
+├── Add parent
+├── Add child
+├── Add spouse
+├── Upload photo
+└── Assign branch
+```
+
+Nhưng cần cực kỳ cẩn thận với Delete.
+
+Không nên:
+
+```text
+DELETE Person
+```
+
+mà không kiểm tra relationship.
+
+---
+
+# 45. Data Integrity
+
+Các rule cần validate:
+
+```text
+Person không được là parent của chính mình.
+
+Person không được có relationship vòng:
+A → B → C → A
+```
+
+`family_person` phải hợp lệ:
+
+```text
+LINEAGE → generation NOT NULL
+NON_LINEAGE → generation NULL
+V1: một person_id duy nhất trong family_person
+```
+
+Generation LINEAGE (khi assign):
+
+```text
+childGeneration = parentGeneration + 1
+(chỉ trên cạnh PARENT_CHILD giữa hai LINEAGE)
+```
+
+Spouse: `sourcePersonId < targetPersonId`, không trùng cặp.
+
+Branch root: MALE + LINEAGE + generation = 2; `rootPersonId` UNIQUE toàn hệ thống.
+
+Parent/child: tối đa 1 biological father + 1 biological mother (backend).
+
+---
+
+# 46. Audit Log
+
+Dữ liệu gia phả cần audit về lâu dài, nhưng **ERD V1 Final chưa có bảng audit** — triển khai ở phase sau (`change_request` / `person_revision` roadmap trong `erd.txt`).
+
+Ví dụ:
+
+```text
+AUDIT_LOG
+
+actor
+action
+entity
+entityId
+oldValue
+newValue
+timestamp
+```
+
+Ví dụ:
+
+```text
+Admin A
+UPDATE
+Person
+123
+
+birthYear:
+1930 → 1931
+
+2026-08-11
+```
+
+Sau này rất hữu ích khi có tranh luận:
+
+> "Ai đã sửa thông tin của cụ?"
+
+---
+
+# 47. Data Versioning
+
+Về lâu dài, dữ liệu gia phả có thể gây tranh luận:
+
+> "Năm sinh là 1930 hay 1931?"
+
+Do đó trong tương lai có thể cần:
+
+```text
+Source
+Evidence
+Confidence
+Note
+```
+
+Ví dụ:
+
+```text
+birthYear = 1930
+
+Source:
+Gia phả giấy đời 5
+
+Confidence:
+HIGH
+```
+
+Tôi chưa đưa vào Phase 1 UI, nhưng **database architecture nên để đường mở rộng**.
+
+---
+
+# 48. Roadmap
+
+## Phase 0 — Architecture
+
+```text
+✓ Business requirements
+✓ Domain model
+✓ UX flow
+✓ Synthetic dataset
+✓ ERD
+✓ API specification
+```
+
+---
+
+## Phase 1 — Core
+
+```text
+Family
+Branch
+Person
+Relationship
+Generation
+
+Public website
+Tree
+Search
+Person profile
+Photo
+```
+
+---
+
+## Phase 1.5 — Historical
+
+```text
+Grave
+Family Events
+Gallery
+Audit log
+```
+
+---
+
+## Phase 2 — Full Family
+
+```text
+Chi 2
+Chi 3
+Chi 4
+```
+
+---
+
+## Phase 3 — Community
+
+```text
+Login
+Member profile
+Contribution
+Correction request
+Approval workflow
+Notifications
+```
+
+---
+
+# 49. Development Breakdown
+
+Backend:
+
+```text
+EPIC: Family
+
+- Create Family model
+- Family API
+- Family repository
+- Family service
+```
+
+```text
+EPIC: FamilyPerson
+
+- family_person model (LINEAGE / NON_LINEAGE)
+- Generation assignment / validation
+- Membership API
+- Lineage vs full tree filters
+```
+
+```text
+EPIC: Branch
+
+- Branch model (PRIMARY/SECONDARY, branch_code)
+- Branch API (CHI_1 …)
+- Root validation (male, LINEAGE, gen 2)
+- Branch-scoped tree query (relationship graph)
+```
+
+```text
+EPIC: Person
+
+- Person CRUD (+ soft delete)
+- Person profile
+- Person search
+- Person media (owner_type PERSON)
+```
+
+```text
+EPIC: Relationship
+
+- Parent/child (max 1 bio father/mother)
+- Spouse (canonical pair, multiple)
+- Cycle prevention
+- Ancestor / descendant / sibling query
+```
+
+```text
+EPIC: Tree
+
+- Tree API (mode=full|lineage)
+- Generation API (family_person LINEAGE)
+- Focus API
+- Branch explorer
+```
+
+Frontend:
+
+```text
+- Homepage
+- Tree Explorer
+- Tree Node
+- Person Card
+- Person Detail
+- Search
+- Branch Explorer
+- Generation Navigator
+- Grave
+- Events
+```
+
+---
+
+# 50. Recommended implementation order
+
+Tôi không khuyên code homepage trước.
+
+Thứ tự nên là:
+
+```text
+1. Domain Model
+       ↓
+2. Database
+       ↓
+3. Synthetic Data Generator
+       ↓
+4. Relationship Query
+       ↓
+5. Tree API
+       ↓
+6. Search API
+       ↓
+7. Tree UI
+       ↓
+8. Person Detail
+       ↓
+9. Branch Explorer
+       ↓
+10. Photo
+       ↓
+11. Grave
+       ↓
+12. Event
+       ↓
+13. Admin
+```
+
+Điểm đặc biệt:
+
+**Synthetic Data Generator nên được làm rất sớm.**
+
+Vì chúng ta chưa có raw data nhưng cần kiểm tra:
+
+```text
+4 chi
+20 đời
+hàng nghìn Person
+hàng chục nghìn Relationship
+```
+
+trước khi UI được coi là hoàn thành.
+
+---
+
+# 51. Synthetic Data Generator
+
+Ta có thể định nghĩa:
+
+```text
+Generation 1
+1 person
+
+Generation 2
+4 children
+
+Generation 3+
+Mỗi male LINEAGE person:
+  3–4 sons (LINEAGE, generation +1)
+  0–2 daughters (LINEAGE, không tạo branch)
+Con của con gái LINEAGE:
+  NON_LINEAGE, generation NULL
+Spouse ngoài dòng:
+  NON_LINEAGE
+```
+
+Ví dụ:
+
+```text
+Generation 1
+1
+
+Generation 2
+4
+
+Generation 3
+~12–16 male lineage + daughters
+
+Generation 4
+~40–60
+
+Generation 5
+~150–250
+
+...
+
+Generation 20
+large dataset
+```
+
+Mỗi Person random:
+
+```text
+name
+gender
+birthYear
+deathYear
+hometown
+biography
+photo
+```
+
+Nhưng phải giữ relationship hợp lệ.
+
+---
+
+# 52. Performance Test Target
+
+Trước mắt không cần đặt con số quá cứng, nhưng tôi đề xuất test với:
+
+```text
+1,000 persons
+5,000 persons
+10,000 persons
+50,000 persons
+100,000 relationships
+```
+
+Các operation cần test:
+
+```text
+Search person
+Load branch
+Load generation
+Load ancestors
+Load descendants
+Focus person
+Render tree
+```
+
+Đặc biệt:
+
+> Không được để `GET tree` vô tình query N+1 relationship.
+
+---
+
+# 53. Architecture Recommendation
+
+Nếu chưa có constraint:
+
+```text
+Frontend
+Next.js / React
+
+Backend
+Spring Boot
+
+Database
+PostgreSQL
+
+Object Storage
+S3-compatible storage
+
+Reverse Proxy
+Nginx
+
+Container
+Docker
+```
+
+Kiến trúc:
+
+```text
+                    Internet
+                       │
+                       ▼
+                 ┌──────────┐
+                 │   CDN    │
+                 └────┬─────┘
+                      │
+              ┌───────▼────────┐
+              │    Frontend    │
+              │    Next.js     │
+              └───────┬────────┘
+                      │
+                     API
+                      │
+              ┌───────▼────────┐
+              │    Backend     │
+              │   Spring Boot  │
+              └───────┬────────┘
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+     ┌────▼─────┐          ┌──────▼──────┐
+     │PostgreSQL│          │Object Store │
+     └──────────┘          └─────────────┘
+```
+
+Không cần microservices.
+
+**Modular Monolith là lựa chọn phù hợp.**
+
+---
+
+# 54. Backend Module Structure
+
+Nếu dùng Spring Boot:
+
+```text
+com.hoangdinh.familytree
+
+├── family
+│   ├── controller
+│   ├── service
+│   ├── repository
+│   └── domain
+│
+├── familyperson
+│   ├── controller
+│   ├── service
+│   ├── repository
+│   └── domain
+│
+├── branch
+│   ├── controller
+│   ├── service
+│   ├── repository
+│   └── domain
+│
+├── person
+│   ├── controller
+│   ├── service
+│   ├── repository
+│   └── domain
+│
+├── relationship
+│   ├── controller
+│   ├── service
+│   ├── repository
+│   └── domain
+│
+├── grave
+├── event
+├── media
+├── search
+├── audit
+└── common
+```
+
+Không nên tổ chức toàn bộ project thành:
+
+```text
+controller/
+service/
+repository/
+entity/
+```
+
+rồi nhét mọi domain vào đó.
+
+Domain-oriented structure sẽ dễ maintain hơn.
+
+---
+
+# 55. Frontend Structure
+
+Nếu dùng Next.js/React:
+
+```text
+src/
+
+├── app/
+│
+├── features/
+│   ├── family/
+│   ├── familyPerson/
+│   ├── branch/
+│   ├── person/
+│   ├── tree/
+│   ├── grave/
+│   └── event/
+│
+├── components/
+│   ├── TreeNode/
+│   ├── PersonCard/
+│   ├── Search/
+│   └── ...
+│
+├── services/
+│
+├── hooks/
+│
+├── types/
+│
+└── utils/
+```
+
+Tree nên là một feature độc lập vì đây là UI phức tạp nhất.
+
+---
+
+# 56. Quyết định Architecture quan trọng nhất
+
+Nguyên tắc đã chốt (ERD V1 Final):
+
+### 1.
+
+```text
+Person ≠ Branch
+```
+
+### 2.
+
+```text
+Person ≠ Lineage Member
+```
+
+Lineage membership = `family_person.membership_type`.
+
+### 3.
+
+```text
+Relationship = source of truth
+```
+
+Full tree = graph relationship. Lineage tree = filter LINEAGE.
+
+### 4.
+
+```text
+Gender ≠ existence
+```
+
+Gender ≠ LINEAGE/NON_LINEAGE. Gender tham gia rule **branch root** (nam + LINEAGE + gen 2).
+
+### 5.
+
+```text
+Tree ≠ entire family data
+```
+
+UI có Full family history vs Chỉ dòng họ.
+
+### 6.
+
+```text
+Phase 1 ≠ architecture chỉ cho Chi 1
+```
+
+Deploy Chi 1; schema hỗ trợ CHI_1…CHI_4 (`branch_code`).
+
+---
+
+# 57. Nghiệp vụ đã chốt (trước đây mở)
+
+### A. Con của con gái trong dòng họ
+
+Lưu đầy đủ **Person** + **PARENT_CHILD** trong **full tree**. Con của con gái: **`NON_LINEAGE`**, `generation = NULL` — không thuộc lineage Hoàng Đình.
+
+### B. Vợ/chồng ngoài dòng họ
+
+**Lưu Person** + `SPOUSE` + `family_person.membership_type = NON_LINEAGE`.
+
+### C. Nhiều vợ
+
+**Có** — nhiều relationship `SPOUSE`; DB canonical pair. UI Phase 1 quyết định cách hiển thị.
+
+### D. Con nuôi / con riêng
+
+Phase 1 chưa UI; model `PARENT_CHILD` mở rộng sau (ADOPTIVE/STEP). V1 backend: tối đa 1 bio father + 1 bio mother.
+
+---
+
+# 58. Definition of Done cho Phase 1
+
+Phase 1 được coi là hoàn thành khi:
+
+```text
+✓ Có dòng họ Hoàng Đình
+
+✓ Có Chi 1
+
+✓ Có ít nhất 20 generation synthetic data
+
+✓ Có Person (+ soft delete deleted_at)
+
+✓ Có family_person (LINEAGE / NON_LINEAGE)
+
+✓ Có Parent/Child relationship
+
+✓ Có Spouse relationship (canonical pair)
+
+✓ Có gender nhưng không dùng gender để hide Person
+
+✓ Có Branch (PRIMARY/SECONDARY, branch_code, không parent_branch_id)
+
+✓ Có Generation trên LINEAGE (family_person)
+
+✓ Có Tree Explorer + toggle Full / Lineage
+
+✓ Có Focus Person
+
+✓ Có Ancestor View
+
+✓ Có Descendant View
+
+✓ Có Search
+
+✓ Có Person Profile
+
+✓ Upload Profile Photo
+
+✓ Có Grave module cơ bản
+
+✓ Có Family Event module cơ bản
+
+✓ Responsive desktop/mobile
+
+✓ Có Admin/CMS tối thiểu để nhập dữ liệu
+
+✓ Database có thể mở rộng lên Chi 2–4
+
+✓ Không load toàn bộ 20 đời trong một API response
+
+✓ Có test với dataset lớn
+```
+
+---
+
+# 59. Kết luận Architecture V1
+
+Mô hình cuối cùng ở giai đoạn này:
+
+```text
+                    HOÀNG ĐÌNH FAMILY
+                           │
+                    FAMILY_PERSON
+                     /          \
+               LINEAGE      NON_LINEAGE
+                    │              │
+              generation      generation NULL
+                    │
+         BRANCH (CHI_1…, gen 2 roots)
+                    │
+                 PERSON
+                    │
+         Parent/Child + Spouse (relationship)
+                    │
+              Media / Grave / Events
+```
+
+Genealogy graph = relationship. Lineage filter = family_person.
+
+Về UX:
+
+```text
+Homepage
+   │
+   ├── Search
+   │
+   ├── Branch Explorer
+   │
+   ├── Family Tree
+   │      ├── Generation
+   │      ├── Focus
+   │      ├── Ancestors
+   │      └── Descendants
+   │
+   ├── Person Profile
+   │
+   ├── Grave
+   │
+   └── Family Events
+```
+
+Về backend:
+
+```text
+Modular Monolith
+        │
+        ├── Family
+        ├── FamilyPerson
+        ├── Branch
+        ├── Person
+        ├── Relationship
+        ├── Grave
+        ├── Event
+        ├── Media
+        └── Search
+```
+
+V1 chưa module Audit (schema chưa có audit_log).
+
+Về database:
+
+```text
+PostgreSQL — 10 bảng (erd.txt)
+```
+
+Về file:
+
+```text
+Object Storage
+```
+
+Về Phase 1:
+
+```text
+1 Family
+1 Primary Branch (CHI_1) deployed
+Schema sẵn CHI_2–4
+20+ LINEAGE generations
+family_person + full tree data
+Large synthetic dataset
+Public read-only
+Admin-ready architecture
+```
+
+---
+
+# 60. Bước kỹ thuật tiếp theo
+
+Domain Model V1 + **ERD V1 Final** đã chốt (`erd.txt`).
+
+Bước tiếp theo nên là:
+
+```text
+              PostgreSQL migrations (erd.txt)
+                       │
+                       ▼
+             Synthetic Data Generator
+                       │
+                       ▼
+                  API Contract
+                       │
+                       ▼
+                Tree UX Prototype
+                       │
+                       ▼
+                 Frontend Coding
+```
+
+Đặc biệt, **Database Design + Synthetic Data Generator** nên làm trước Tree UI.
+
+Lý do là chúng ta cần chứng minh được rằng mô hình có thể xử lý:
+
+```text
+20 generations
+10,000+ persons
+nhiều branch
+nhiều relationship
+```
+
+rồi mới xây UI dựa trên dữ liệu thật.
